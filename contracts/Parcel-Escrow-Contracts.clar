@@ -9,6 +9,7 @@
 (define-constant err-not-expired (err u107))
 (define-constant err-invalid-verification (err u108))
 (define-constant err-insufficient-funds (err u109))
+(define-constant err-not-agreed (err u110))
 
 (define-data-var next-escrow-id uint u1)
 (define-data-var platform-fee-rate uint u250)
@@ -31,6 +32,7 @@
 
 (define-map user-escrows principal (list 100 uint))
 (define-map verification-attempts uint uint)
+(define-map mutual-consent uint {sender-agrees: bool, recipient-agrees: bool, action: (string-ascii 10)})
 
 (define-read-only (get-escrow (escrow-id uint))
   (map-get? escrows escrow-id))
@@ -60,6 +62,9 @@
 
 (define-read-only (get-verification-attempts (escrow-id uint))
   (default-to u0 (map-get? verification-attempts escrow-id)))
+
+(define-read-only (get-mutual-consent-status (escrow-id uint))
+  (map-get? mutual-consent escrow-id))
 
 (define-private (generate-verification-code (escrow-id uint) (sender principal) (recipient principal))
   (sha256 (concat 
@@ -121,7 +126,12 @@
     (asserts! (not (get refunded escrow-data)) err-already-refunded)
     (asserts! (not (is-escrow-expired escrow-id)) err-expired)
     (asserts! (< attempts u5) err-invalid-verification)
-    (asserts! (is-eq verification-code (get verification-code escrow-data)) err-invalid-verification)
+    
+    (if (is-eq verification-code (get verification-code escrow-data))
+      true
+      (begin
+        (map-set verification-attempts escrow-id (+ attempts u1))
+        (asserts! false err-invalid-verification)))
     
     (try! (transfer-stx-from-escrow (get amount escrow-data) (get recipient escrow-data)))
     
@@ -224,6 +234,66 @@
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
     (var-set max-escrow-duration new-duration)
     (ok true)))
+
+(define-public (propose-mutual-resolution (escrow-id uint) (action (string-ascii 10)))
+  (let ((escrow-data (unwrap! (map-get? escrows escrow-id) err-not-found))
+        (is-sender (is-eq tx-sender (get sender escrow-data)))
+        (is-recipient (is-eq tx-sender (get recipient escrow-data))))
+    
+    (asserts! (or is-sender is-recipient) err-unauthorized)
+    (asserts! (not (get delivery-confirmed escrow-data)) err-already-confirmed)
+    (asserts! (not (get refunded escrow-data)) err-already-refunded)
+    (asserts! (or (is-eq action "release") (is-eq action "cancel")) err-invalid-amount)
+    
+    (map-set mutual-consent escrow-id {
+      sender-agrees: is-sender,
+      recipient-agrees: is-recipient,
+      action: action
+    })
+    
+    (ok true)))
+
+(define-public (agree-to-resolution (escrow-id uint))
+  (let ((escrow-data (unwrap! (map-get? escrows escrow-id) err-not-found))
+        (consent-data (unwrap! (map-get? mutual-consent escrow-id) err-not-found))
+        (is-sender (is-eq tx-sender (get sender escrow-data)))
+        (is-recipient (is-eq tx-sender (get recipient escrow-data))))
+    
+    (asserts! (or is-sender is-recipient) err-unauthorized)
+    (asserts! (not (get delivery-confirmed escrow-data)) err-already-confirmed)
+    (asserts! (not (get refunded escrow-data)) err-already-refunded)
+    
+    (asserts! (not (and is-sender (get sender-agrees consent-data))) err-not-agreed)
+    (asserts! (not (and is-recipient (get recipient-agrees consent-data))) err-not-agreed)
+    
+    (let ((updated-consent (merge consent-data {
+            sender-agrees: (or (get sender-agrees consent-data) is-sender),
+            recipient-agrees: (or (get recipient-agrees consent-data) is-recipient)
+          })))
+      
+      (if (and (get sender-agrees updated-consent) (get recipient-agrees updated-consent))
+        (begin
+          (if (is-eq (get action consent-data) "release")
+            (begin
+              (try! (transfer-stx-from-escrow (get amount escrow-data) (get recipient escrow-data)))
+              (if (> (get fee escrow-data) u0)
+                (try! (transfer-stx-from-escrow (get fee escrow-data) contract-owner))
+                true)
+              (map-set escrows escrow-id (merge escrow-data {
+                status: "mutual-release",
+                delivery-confirmed: true
+              })))
+            (begin
+              (try! (transfer-stx-from-escrow (+ (get amount escrow-data) (get fee escrow-data)) (get sender escrow-data)))
+              (map-set escrows escrow-id (merge escrow-data {
+                status: "mutual-cancel",
+                refunded: true
+              }))))
+          (map-delete mutual-consent escrow-id)
+          (ok true))
+        (begin
+          (map-set mutual-consent escrow-id updated-consent)
+          (ok false))))))
 
 (define-public (emergency-release (escrow-id uint) (to-recipient bool))
   (let ((escrow-data (unwrap! (map-get? escrows escrow-id) err-not-found)))
